@@ -9,6 +9,8 @@ const http = require('http');
 const net = require('net');
 const tls = require('tls');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { URL } = require('url');
 
 const Sender = require('../lib/sender');
@@ -1675,6 +1677,186 @@ describe('WebSocket', () => {
           assert.strictEqual(req.headers.cookie, undefined);
           ws.close();
         });
+      });
+    });
+
+    describe('When following a redirect to a UNIX domain socket', function () {
+      //
+      // UNIX domain sockets are not available on Windows.
+      //
+      if (process.platform === 'win32') return this.skip();
+
+      function ipcPath() {
+        return path.join(
+          os.tmpdir(),
+          `ws-${crypto.randomBytes(16).toString('hex')}.sock`
+        );
+      }
+
+      function removeIpcPath(filepath, cb) {
+        fs.unlink(filepath, (err) => {
+          //
+          // Recent versions of Node.js remove the socket file when the server
+          // is closed.
+          //
+          if (err && err.code !== 'ENOENT') return cb(err);
+          cb();
+        });
+      }
+
+      it('keeps the url userinfo when the socket path is the same', (done) => {
+        const redirectingServerIpcPath = ipcPath();
+        const authorization =
+          'Basic ' + Buffer.from('foo:bar').toString('base64');
+
+        const redirectingServer = http.createServer();
+        const wss = new WebSocket.Server({ noServer: true });
+
+        const requests = [];
+
+        redirectingServer.on('upgrade', (req, socket, head) => {
+          requests.push(req);
+
+          if (requests.length === 1) {
+            //
+            // Redirect to another path on the very same socket.
+            //
+            socket.end(
+              'HTTP/1.1 302 Found\r\n' +
+                `Location: ws+unix://${encodeURIComponent(
+                  redirectingServerIpcPath
+                )}/other\r\n\r\n`
+            );
+          } else {
+            wss.handleUpgrade(req, socket, head, (ws) => {
+              ws.close();
+            });
+          }
+        });
+
+        wss.on('connection', (ws, req) => {
+          //
+          // This is the second request, after the redirect.
+          //
+          assert.strictEqual(req.url, '/other');
+          assert.strictEqual(req.headers.authorization, authorization);
+        });
+
+        redirectingServer.listen(redirectingServerIpcPath, () => {
+          const ws = new WebSocket(
+            `ws+unix://foo:bar@${encodeURIComponent(
+              redirectingServerIpcPath
+            )}/path`,
+            {
+              followRedirects: true
+            }
+          );
+
+          assert.strictEqual(ws._req.getHeader('Authorization'), authorization);
+
+          ws.on('redirect', (url, request) => {
+            assert.strictEqual(ws._redirects, 1);
+            assert.strictEqual(
+              url,
+              `ws+unix://${encodeURIComponent(redirectingServerIpcPath)}/other`
+            );
+            assert.strictEqual(
+              request.getHeader('Authorization'),
+              authorization
+            );
+          });
+
+          ws.on('close', (code) => {
+            assert.strictEqual(code, 1005);
+
+            //
+            // Both requests hit the same socket and both had to carry the
+            // credentials parsed from the initial url userinfo.
+            //
+            assert.strictEqual(requests.length, 2);
+            assert.strictEqual(requests[0].url, '/path');
+            assert.strictEqual(
+              requests[0].headers.authorization,
+              authorization
+            );
+            assert.strictEqual(ws._redirects, 1);
+
+            redirectingServer.close(() => {
+              removeIpcPath(redirectingServerIpcPath, done);
+            });
+          });
+        });
+      });
+
+      it('drops the Authorization, Cookie and Host headers (2/2)', (done) => {
+        // Test the `ws+unix:` to `ws+unix:` case when the socket path is
+        // different.
+        const redirectingServerIpcPath = ipcPath();
+        const redirectedServerIpcPath = ipcPath();
+
+        const redirectingServer = http.createServer();
+        const redirectedServer = http.createServer();
+        const wss = new WebSocket.Server({ server: redirectedServer });
+
+        redirectingServer.on('upgrade', (req, socket) => {
+          socket.end(
+            'HTTP/1.1 302 Found\r\n' +
+              `Location: ws+unix:${redirectedServerIpcPath}:/other\r\n\r\n`
+          );
+        });
+
+        wss.on('connection', (ws, req) => {
+          assert.strictEqual(req.headers.authorization, undefined);
+          assert.strictEqual(req.headers.cookie, undefined);
+          assert.strictEqual(req.headers.host, 'localhost');
+          ws.close();
+        });
+
+        redirectingServer.listen(redirectingServerIpcPath, listening);
+        redirectedServer.listen(redirectedServerIpcPath, listening);
+
+        let callCount = 0;
+
+        function listening() {
+          if (++callCount !== 2) return;
+
+          const headers = {
+            authorization: 'Basic Zm9vOmJhcg==',
+            cookie: 'foo=bar',
+            host: 'foo'
+          };
+
+          const ws = new WebSocket(
+            `ws+unix:${redirectingServerIpcPath}:/path`,
+            { followRedirects: true, headers }
+          );
+
+          const firstRequest = ws._req;
+
+          assert.strictEqual(
+            firstRequest.getHeader('Authorization'),
+            headers.authorization
+          );
+          assert.strictEqual(firstRequest.getHeader('Cookie'), headers.cookie);
+          assert.strictEqual(firstRequest.getHeader('Host'), headers.host);
+
+          ws.on('close', (code) => {
+            assert.strictEqual(code, 1005);
+            assert.strictEqual(
+              ws.url,
+              `ws+unix:${redirectedServerIpcPath}:/other`
+            );
+            assert.strictEqual(ws._redirects, 1);
+
+            redirectingServer.close(() => {
+              redirectedServer.close(() => {
+                removeIpcPath(redirectingServerIpcPath, () => {
+                  removeIpcPath(redirectedServerIpcPath, done);
+                });
+              });
+            });
+          });
+        }
       });
     });
   });
