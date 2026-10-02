@@ -9,6 +9,8 @@ const http = require('http');
 const net = require('net');
 const tls = require('tls');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { URL } = require('url');
 
 const Sender = require('../lib/sender');
@@ -1674,6 +1676,294 @@ describe('WebSocket', () => {
           assert.strictEqual(req.headers.authorization, undefined);
           assert.strictEqual(req.headers.cookie, undefined);
           ws.close();
+        });
+      });
+    });
+
+    describe('When redirecting on a UNIX domain socket', function () {
+      this.timeout(4000);
+
+      const authorization = 'Basic Zm9vOmJhcg==';
+      let wss;
+
+      //
+      // Skip these tests on Windows. The URL parser:
+      //
+      // - Throws an error if the named pipe uses backward slashes.
+      // - Incorrectly parses the path if the named pipe uses forward slashes.
+      //
+      beforeEach(function () {
+        if (process.platform === 'win32') return this.skip();
+
+        wss = new WebSocket.Server({ noServer: true });
+      });
+
+      afterEach((done) => wss.close(done));
+
+      function listenOnUnixSocket() {
+        const httpServer = http.createServer();
+        const sockPath = path.join(
+          os.tmpdir(),
+          `ws.${crypto.randomBytes(16).toString('hex')}.sock`
+        );
+
+        return new Promise((resolve, reject) => {
+          httpServer.on('error', reject);
+          httpServer.listen(sockPath, () => {
+            httpServer.removeListener('error', reject);
+            resolve({ httpServer, sockPath });
+          });
+        });
+      }
+
+      function redirectOnUpgrade(socket, location, statusCode = 302) {
+        socket.write(
+          `HTTP/1.1 ${statusCode} Found\r\n` +
+            `Location: ${location}\r\n` +
+            '\r\n'
+        );
+        socket.destroy();
+      }
+
+      it('keeps the userinfo credentials on a same socket redirect', (done) => {
+        listenOnUnixSocket().then(({ httpServer, sockPath }) => {
+          const seen = [];
+
+          httpServer.on('upgrade', (req, socket, head) => {
+            seen.push({
+              url: req.url,
+              authorization: req.headers.authorization
+            });
+
+            if (req.url === '/redirect') {
+              redirectOnUpgrade(socket, '/target');
+            } else {
+              wss.handleUpgrade(req, socket, head, (client) => client.close());
+            }
+          });
+
+          const address =
+            'ws+unix://foo:bar@' + encodeURIComponent(sockPath) + '/redirect';
+          const ws = new WebSocket(address, { followRedirects: true });
+
+          assert.strictEqual(ws._req.getHeader('Authorization'), authorization);
+
+          ws.on('redirect', (url, request) => {
+            assert.strictEqual(ws._redirects, 1);
+            assert.strictEqual(
+              url,
+              'ws+unix://foo:bar@' + encodeURIComponent(sockPath) + '/target'
+            );
+            assert.strictEqual(
+              request.getHeader('Authorization'),
+              authorization
+            );
+          });
+
+          ws.on('close', (code) => {
+            assert.strictEqual(code, 1005);
+            assert.strictEqual(ws._redirects, 1);
+            assert.deepStrictEqual(seen, [
+              { url: '/redirect', authorization },
+              { url: '/target', authorization }
+            ]);
+
+            httpServer.close(done);
+          });
+        });
+      });
+
+      it('keeps the userinfo credentials when the same socket is spelled differently', (done) => {
+        listenOnUnixSocket().then(({ httpServer, sockPath }) => {
+          const seen = [];
+
+          httpServer.on('upgrade', (req, socket, head) => {
+            seen.push({
+              url: req.url,
+              authorization: req.headers.authorization
+            });
+
+            if (req.url === '/redirect') {
+              //
+              // The same physical socket is referenced here using the documented
+              // `ws+unix:///socket:/path` spelling rather than the percent-encoded
+              // host spelling used for the initial request.
+              //
+              redirectOnUpgrade(socket, `ws+unix://${sockPath}:/target`);
+            } else if (req.headers.authorization === authorization) {
+              wss.handleUpgrade(req, socket, head, (client) => client.close());
+            } else {
+              //
+              // Reproduce the reported failure: without the credentials the
+              // handshake is rejected with a 401 status code.
+              //
+              socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+              socket.destroy();
+            }
+          });
+
+          //
+          // No `'redirect'` event listener is attached, so the client is in
+          // charge of deciding which credentials are safe to forward.
+          //
+          const ws = new WebSocket(
+            'ws+unix://foo:bar@' + encodeURIComponent(sockPath) + '/redirect',
+            { followRedirects: true }
+          );
+
+          assert.strictEqual(ws._req.getHeader('Authorization'), authorization);
+
+          ws.on('unexpected-response', (request, response) => {
+            response.resume();
+            response.on('end', () => {
+              finish(
+                new Error(
+                  'The Authorization header was dropped on a same socket redirect'
+                )
+              );
+            });
+          });
+
+          ws.on('close', (code) => {
+            //
+            // Reaching the normal close path means the credentials were
+            // forwarded to the second hop.
+            //
+            assert.strictEqual(code, 1005);
+            assert.strictEqual(ws._redirects, 1);
+            assert.strictEqual(ws.url, `ws+unix://${sockPath}:/target`);
+            assert.deepStrictEqual(seen, [
+              { url: '/redirect', authorization },
+              { url: '/target', authorization }
+            ]);
+
+            finish();
+          });
+
+          let finished = false;
+
+          function finish(err) {
+            if (finished) return;
+            finished = true;
+
+            httpServer.close(() => done(err));
+          }
+        });
+      });
+
+      it('drops the userinfo credentials when redirecting to another socket', (done) => {
+        Promise.all([listenOnUnixSocket(), listenOnUnixSocket()]).then(
+          ([first, second]) => {
+            first.httpServer.on('upgrade', (req, socket) => {
+              redirectOnUpgrade(
+                socket,
+                'ws+unix://foo:bar@' +
+                  encodeURIComponent(second.sockPath) +
+                  '/target'
+              );
+            });
+
+            second.httpServer.on('upgrade', (req, socket, head) => {
+              wss.handleUpgrade(req, socket, head, (client) => client.close());
+            });
+
+            wss.on('connection', (ws, req) => {
+              assert.strictEqual(req.headers.authorization, undefined);
+            });
+
+            const ws = new WebSocket(
+              'ws+unix://foo:bar@' +
+                encodeURIComponent(first.sockPath) +
+                '/redirect',
+              { followRedirects: true }
+            );
+
+            assert.strictEqual(
+              ws._req.getHeader('Authorization'),
+              authorization
+            );
+
+            ws.on('close', (code) => {
+              assert.strictEqual(code, 1005);
+              assert.strictEqual(ws._redirects, 1);
+
+              first.httpServer.close(() => {
+                second.httpServer.close(done);
+              });
+            });
+          }
+        );
+      });
+
+      it('drops the userinfo credentials when redirecting from a socket to TCP', (done) => {
+        listenOnUnixSocket().then(({ httpServer: unixServer, sockPath }) => {
+          const tcpWss = new WebSocket.Server({ port: 0 }, () => {
+            const port = tcpWss.address().port;
+
+            unixServer.on('upgrade', (req, socket) => {
+              redirectOnUpgrade(
+                socket,
+                `ws://foo:bar@localhost:${port}/target`
+              );
+            });
+
+            tcpWss.on('connection', (ws, req) => {
+              assert.strictEqual(req.url, '/target');
+              assert.strictEqual(req.headers.authorization, undefined);
+              ws.close();
+            });
+
+            const ws = new WebSocket(
+              'ws+unix://foo:bar@' + encodeURIComponent(sockPath) + '/redirect',
+              { followRedirects: true }
+            );
+
+            assert.strictEqual(
+              ws._req.getHeader('Authorization'),
+              authorization
+            );
+
+            ws.on('close', (code) => {
+              assert.strictEqual(code, 1005);
+              assert.strictEqual(ws._redirects, 1);
+
+              unixServer.close(() => {
+                tcpWss.close(done);
+              });
+            });
+          });
+        });
+      });
+
+      it('keeps credentials removed from a redirect event listener', (done) => {
+        listenOnUnixSocket().then(({ httpServer, sockPath }) => {
+          httpServer.on('upgrade', (req, socket, head) => {
+            if (req.url === '/redirect') {
+              redirectOnUpgrade(socket, '/target');
+            } else {
+              assert.strictEqual(req.headers.authorization, undefined);
+              wss.handleUpgrade(req, socket, head, (client) => client.close());
+            }
+          });
+
+          const ws = new WebSocket(
+            'ws+unix://foo:bar@' + encodeURIComponent(sockPath) + '/redirect',
+            { followRedirects: true }
+          );
+
+          ws.on('redirect', (url, request) => {
+            assert.strictEqual(ws._redirects, 1);
+            assert.strictEqual(
+              request.getHeader('Authorization'),
+              authorization
+            );
+            request.removeHeader('Authorization');
+          });
+
+          ws.on('close', (code) => {
+            assert.strictEqual(code, 1005);
+            httpServer.close(done);
+          });
         });
       });
     });
